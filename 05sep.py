@@ -262,7 +262,7 @@ if "single_type_results" in st.session_state or "mixed" in st.session_state:
             chosen_result, cnt, spec = st.session_state.single_type_results[choice]
             st.info(f"{choice}: {cnt} used")
 
-            gap = st.slider("ULD spacing (cm)", 300, 500, 250, 10, key="gap_single")
+            gap = st.slider("ULD spacing (cm)", 300, 800, 350, 10, key="gap_single")
             OFFSET = gap
 
             fig = go.Figure()
@@ -375,6 +375,7 @@ if "single_type_results" in st.session_state or "mixed" in st.session_state:
             st.plotly_chart(fig, use_container_width=True)
         else:
             st.info("Enable Mixed ULD mode and click **Simulate**.")
+
 
 
 
