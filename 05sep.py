@@ -7,18 +7,18 @@ from collections import Counter, defaultdict
 from functools import lru_cache
 
 # ==============================
-# ULD definitions (latest specs)
+# ULD definitions 
 # ==============================
 ULD_SPECS = {
-    "AKE": {"length": 142, "width": 139, "height": 159, "max_weight": 1500},  # 4 cbm
-    "LD7": {"length": 300, "width": 240, "height": 162, "max_weight": 5000},  # 10 cbm
-    "PLA": {"length": 307, "width": 142, "height": 162, "max_weight": 3174},  # 8 cbm
+    "AKE": {"length": 142, "width": 139, "height": 159, "max_weight": 1500},  
+    "LD7": {"length": 300, "width": 240, "height": 162, "max_weight": 5000}, 
+    "PLA": {"length": 307, "width": 142, "height": 162, "max_weight": 3174}, 
 }
-VOLUME_UNITS = {"AKE": 4.0, "LD7": 10.0, "PLA": 8.0}  # internal use only
-ULD_ORDER = ["AKE", "LD7", "PLA"]  # display order
+VOLUME_UNITS = {"AKE": 4.0, "LD7": 10.0, "PLA": 8.0}  
+ULD_ORDER = ["AKE", "LD7", "PLA"] 
 
 # Colors: ULD outlines by type; boxes one standard color everywhere
-MIXED_COLORS = {"AKE": "#000000", "LD7": "#00aa00", "PLA": "#cc0000"}  # outlines
+MIXED_COLORS = {"AKE": "#000000", "LD7": "#00aa00", "PLA": "#cc0000"}  
 BOX_COLOR = "#1f77b4"  # standardized box color
 
 st.set_page_config(layout="wide", initial_sidebar_state="collapsed")
@@ -239,7 +239,7 @@ def draw_box_wireframe(fig, corners, color, width=2, showlegend=False, name=None
 if "single_type_results" in st.session_state or "mixed" in st.session_state:
     tab_single, tab_mixed = st.tabs(["Single ULD results", "Mixed ULD plan"])
 
-    # --- Single ULD tab (2-row table + viz) ---
+    # --- Single ULD tab---
     with tab_single:
         counts = st.session_state.get("single_counts", {})
         if counts:
@@ -334,7 +334,7 @@ if "single_type_results" in st.session_state or "mixed" in st.session_state:
                 st.table(df)
 
             # Visualization
-            gap = st.slider("ULD spacing (cm)", 200, 300, 250, 10, key="gap_mixed")
+            gap = st.slider("ULD spacing (cm)", 300, 500, 250, 10, key="gap_mixed")
             OFFSET = gap
 
             fig = go.Figure()
@@ -375,6 +375,7 @@ if "single_type_results" in st.session_state or "mixed" in st.session_state:
             st.plotly_chart(fig, use_container_width=True)
         else:
             st.info("Enable Mixed ULD mode and click **Simulate**.")
+
 
 
 
