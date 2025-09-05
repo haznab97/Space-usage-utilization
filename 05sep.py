@@ -29,7 +29,7 @@ st.title("Estimation Load Plan")
 # ==============================
 st.sidebar.header("Settings")
 run_mixed = st.sidebar.checkbox("Enable Mixed ULD mode", value=True)
-gap_mixed_default = st.sidebar.slider("Mixed mode spacing (cm)", 200, 300, 250, 10)
+gap_mixed_default = st.sidebar.slider("Mixed mode spacing (cm)", 300, 500, 250, 10)
 
 # ==============================
 # Input form
@@ -375,6 +375,7 @@ if "single_type_results" in st.session_state or "mixed" in st.session_state:
             st.plotly_chart(fig, use_container_width=True)
         else:
             st.info("Enable Mixed ULD mode and click **Simulate**.")
+
 
 
 
