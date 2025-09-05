@@ -2,6 +2,7 @@ import streamlit as st
 import plotly.graph_objects as go
 import copy
 import json
+import pandas as pd
 from collections import Counter, defaultdict
 from functools import lru_cache
 
@@ -13,21 +14,22 @@ ULD_SPECS = {
     "LD7": {"length": 300, "width": 240, "height": 162, "max_weight": 5000},  # 10 cbm
     "PLA": {"length": 307, "width": 142, "height": 162, "max_weight": 3174},  # 8 cbm
 }
-VOLUME_UNITS = {"AKE": 4.0, "LD7": 10.0, "PLA": 8.0}  # used internally if needed
+VOLUME_UNITS = {"AKE": 4.0, "LD7": 10.0, "PLA": 8.0}  # internal use only
+ULD_ORDER = ["AKE", "LD7", "PLA"]  # display order
 
 # Colors: ULD outlines by type; boxes one standard color everywhere
 MIXED_COLORS = {"AKE": "#000000", "LD7": "#00aa00", "PLA": "#cc0000"}  # outlines
 BOX_COLOR = "#1f77b4"  # standardized box color
 
 st.set_page_config(layout="wide", initial_sidebar_state="collapsed")
-st.title("Multi-ULD Cargo Optimizer — FFD-shelf + Mixed-Type")
+st.title("Estimation Load Plan")
 
 # ==============================
 # Sidebar
 # ==============================
 st.sidebar.header("Settings")
 run_mixed = st.sidebar.checkbox("Enable Mixed ULD mode", value=True)
-gap_mixed_default = st.sidebar.slider("Mixed mode spacing (cm)", 200, 1000, 600, 50)
+gap_mixed_default = st.sidebar.slider("Mixed mode spacing (cm)", 200, 300, 250, 10)
 
 # ==============================
 # Input form
@@ -53,7 +55,6 @@ with st.form("cargo_input"):
 # ==============================
 def pack_boxes_ffd_shelf(boxes, uld_spec):
     L, W, H, WMAX = uld_spec["length"], uld_spec["width"], uld_spec["height"], uld_spec["max_weight"]
-    # sort by base area then height desc
     boxes = sorted(boxes, key=lambda b: (b["length"] * b["width"], b["height"]), reverse=True)
 
     packed = []
@@ -91,7 +92,7 @@ def pack_boxes_ffd_shelf(boxes, uld_spec):
                                 "length": bl, "width": bw, "height": box["height"],
                                 "weight": box["weight"],
                                 "x": x, "y": row_y, "z": layer_z,
-                                "uld_id": uld_count  # local to this type/instance
+                                "uld_id": uld_count
                             }
                             packed.append(pb)
                             placed_indices.add(i)
@@ -102,9 +103,7 @@ def pack_boxes_ffd_shelf(boxes, uld_spec):
                             layer_height = max(layer_height, row_height)
                             used_weight += box["weight"]
 
-                            placed_in_row = True
-                            placed_in_layer = True
-                            placed_any = True
+                            placed_in_row = placed_in_layer = placed_any = True
                             break
 
                 if not placed_in_row:
@@ -124,15 +123,9 @@ def pack_boxes_ffd_shelf(boxes, uld_spec):
     return packed, uld_count
 
 # ==============================
-# Mixed-Type Optimizer (recursive search, expands into instances)
+# Mixed-Type Optimizer (recursive search)
 # ==============================
 def pack_mixed_optimizer(boxes, uld_specs, unit_costs):
-    """
-    Returns:
-      instances: list of {"type": name, "spec": spec, "packed": [boxes in that instance (coords relative to ULD origin)]}
-      total_units: float
-      placed_all: same boxes flattened with 'uld_idx' for viz offset
-    """
     def pack_into_type(bxs, type_name):
         spec = uld_specs[type_name]
         packed, cnt = pack_boxes_ffd_shelf(copy.deepcopy(bxs), spec)
@@ -144,7 +137,7 @@ def pack_mixed_optimizer(boxes, uld_specs, unit_costs):
         instances = []
         for _, grp in sorted(groups.items()):
             for g in grp:
-                g["uld_id"] = 0  # normalize; we'll add uld_idx later
+                g["uld_id"] = 0
             instances.append({"type": type_name, "spec": spec, "packed": grp})
         units = cnt * unit_costs[type_name]
         return instances, units
@@ -160,13 +153,11 @@ def pack_mixed_optimizer(boxes, uld_specs, unit_costs):
 
         best_plan, best_units = None, float("inf")
 
-        # Try packing ALL in each single type
         for name in uld_specs.keys():
             insts, units = pack_into_type(bxs, name)
             if insts is not None and units < best_units:
                 best_plan, best_units = insts, units
 
-        # Try simple split
         n = len(bxs)
         if n > 1:
             for i in range(1, n):
@@ -184,7 +175,6 @@ def pack_mixed_optimizer(boxes, uld_specs, unit_costs):
     if plan is None:
         return None, float("inf"), None
 
-    # Flatten for visualization; assign a global instance index (uld_idx)
     placed_all = []
     for idx, inst in enumerate(plan):
         for p in inst["packed"]:
@@ -205,17 +195,16 @@ if submitted:
                 "height": item["height"], "weight": item["weight"]
             })
 
-    # Single-ULD results
+    # Single-ULD results (counts per type)
     single_results = {}
-    single_table = []
+    single_counts = {}  # name -> count
     for name, spec in ULD_SPECS.items():
         packed, cnt = pack_boxes_ffd_shelf(copy.deepcopy(all_boxes), spec)
         if packed:
             single_results[name] = (packed, cnt, spec)
-            units = cnt * VOLUME_UNITS[name]
-            single_table.append((name, cnt, units))
+            single_counts[name] = cnt
     st.session_state.single_type_results = single_results
-    st.session_state.single_type_table = single_table
+    st.session_state.single_counts = single_counts
 
     # Mixed results
     if run_mixed:
@@ -247,25 +236,38 @@ def draw_box_wireframe(fig, corners, color, width=2, showlegend=False, name=None
 # ==============================
 # Show results
 # ==============================
-if "single_type_table" in st.session_state or "mixed" in st.session_state:
+if "single_type_results" in st.session_state or "mixed" in st.session_state:
     tab_single, tab_mixed = st.tabs(["Single ULD results", "Mixed ULD plan"])
 
-    # --- Single ULD tab ---
+    # --- Single ULD tab (2-row table + viz) ---
     with tab_single:
-        if st.session_state.get("single_type_table"):
+        counts = st.session_state.get("single_counts", {})
+        if counts:
+            # Build 2-row table: Type of ULD (row 1), Amount needed (row 2)
+            used_types = [t for t in ULD_ORDER if t in counts]
+            data = [
+                [t for t in used_types],            # Row 1
+                [counts[t] for t in used_types],    # Row 2
+            ]
+            df = pd.DataFrame(
+                data,
+                index=["Type of ULD", "Amount needed"],
+                columns=used_types
+            )
             st.subheader("Single-ULD results (FFD)")
-            st.table(st.session_state.single_type_table)
+            st.table(df)
 
-            choice = st.selectbox("Select ULD to visualize", list(st.session_state.single_type_results.keys()))
+            # Visualize a selected single-ULD packing
+            choice = st.selectbox("Select ULD to visualize", used_types)
             chosen_result, cnt, spec = st.session_state.single_type_results[choice]
             st.info(f"{choice}: {cnt} used")
 
-            gap = st.slider("ULD spacing (cm)", 200, 1000, 600, 50, key="gap_single")
+            gap = st.slider("ULD spacing (cm)", 200, 300, 250, 10, key="gap_single")
             OFFSET = gap
 
             fig = go.Figure()
 
-            # Draw ULD frames (neutral gray)
+            # ULD frames
             for uld_id in sorted(set(b["uld_id"] for b in chosen_result)):
                 x0 = uld_id * OFFSET
                 x1 = x0 + spec["length"]
@@ -274,7 +276,7 @@ if "single_type_table" in st.session_state or "mixed" in st.session_state:
                            [x0,0,z1],[x1,0,z1],[x1,y1,z1],[x0,y1,z1]]
                 draw_box_wireframe(fig, corners, color="#666666", width=3)
 
-            # Draw boxes (standardized color)
+            # Boxes (standard color)
             for b in chosen_result:
                 x = b["x"] + b["uld_id"] * OFFSET
                 y, z = b["y"], b["z"]
@@ -297,11 +299,11 @@ if "single_type_table" in st.session_state or "mixed" in st.session_state:
         else:
             st.info("No single-type packing feasible with current inputs.")
 
-    # --- Mixed ULD tab ---
+    # --- Mixed ULD tab (2-row plan + viz) ---
     with tab_mixed:
         mix = st.session_state.get("mixed")
         if mix:
-            # Rebuild placed_all if needed (defensive against stale state)
+            # Defensive rebuild of placed_all
             placed_all = mix.get("placed_all") or []
             if any("uld_idx" not in b for b in placed_all):
                 rebuilt = []
@@ -313,17 +315,31 @@ if "single_type_table" in st.session_state or "mixed" in st.session_state:
                 mix["placed_all"] = rebuilt
                 st.session_state.mixed = mix
 
+            # 2-row table
             type_counts = Counter(inst["type"] for inst in mix["instances"])
-            summary = ", ".join(f"{t}×{c}" for t, c in type_counts.items()) or "No ULDs"
-            st.subheader("Mixed plan")
-            st.markdown(f"**Plan:** {summary}")
+            used_types = [t for t in ULD_ORDER if type_counts[t] > 0]
+            if not used_types:
+                st.info("No ULDs used for the current inputs.")
+            else:
+                data = [
+                    [t for t in used_types],
+                    [type_counts[t] for t in used_types],
+                ]
+                df = pd.DataFrame(
+                    data,
+                    index=["Type of ULD", "Amount needed"],
+                    columns=used_types
+                )
+                st.subheader("Mixed ULD plan")
+                st.table(df)
 
-            gap = st.slider("ULD spacing (cm)", 200, 1000, gap_mixed_default, 50, key="gap_mixed")
+            # Visualization
+            gap = st.slider("ULD spacing (cm)", 200, 300, 250, 10, key="gap_mixed")
             OFFSET = gap
 
             fig = go.Figure()
 
-            # Draw each instance's frame with its own color by type (outlines only)
+            # ULD outlines by type
             for idx, inst in enumerate(mix["instances"]):
                 spec = inst["spec"]
                 color = MIXED_COLORS.get(inst["type"], "#666666")
@@ -334,13 +350,10 @@ if "single_type_table" in st.session_state or "mixed" in st.session_state:
                            [x0,0,z1],[x1,0,z1],[x1,y1,z1],[x0,y1,z1]]
                 draw_box_wireframe(fig, corners, color=color, width=4, showlegend=True, name=f"{inst['type']} #{idx}")
 
-            # Draw all placed boxes using the standardized color
+            # Boxes (standard color)
             for b in mix["placed_all"]:
-                if "uld_idx" not in b:
+                if "uld_idx" not in b or b["uld_idx"] < 0 or b["uld_idx"] >= len(mix["instances"]):
                     continue
-                if b["uld_idx"] < 0 or b["uld_idx"] >= len(mix["instances"]):
-                    continue
-
                 x = b["x"] + b["uld_idx"] * OFFSET
                 y, z = b["y"], b["z"]
                 l, w, h = b["length"], b["width"], b["height"]
