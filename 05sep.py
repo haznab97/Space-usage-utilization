@@ -30,7 +30,7 @@ st.title("Estimation Load Plan")
 st.sidebar.header("Settings")
 run_mixed = st.sidebar.checkbox("Enable Mixed ULD mode", value=True)
 # keep within the requested tight range for spacing
-default_spacing_cm = st.sidebar.slider("Default ULD spacing (cm) when visualizing", 200, 300, 250, 10)
+default_spacing_cm = st.sidebar.slider("Default ULD spacing (cm) when visualizing", 200, 500, 250, 10)
 MAX_BOXES_TO_DRAW = st.sidebar.number_input(
     "Max boxes to draw in 3D",
     min_value=50, max_value=5000, value=400, step=50,
@@ -302,7 +302,7 @@ if "single_type_results" in st.session_state or "mixed" in st.session_state:
                 st.session_state.show3d_single = True
 
             if st.session_state.show3d_single:
-                gap = st.slider("3D spacing (cm)", 200, 300, default_spacing_cm, 10, key="gap_single")
+                gap = st.slider("3D spacing (cm)", 300, 500, default_spacing_cm, 10, key="gap_single")
                 OFFSET = gap
 
                 draw_iter = chosen_result
@@ -369,7 +369,7 @@ if "single_type_results" in st.session_state or "mixed" in st.session_state:
                 st.session_state.show3d_mixed = True
 
             if st.session_state.show3d_mixed and mix.get("instances"):
-                gap = st.slider("3D spacing (cm)", 200, 300, default_spacing_cm, 10, key="gap_mixed")
+                gap = st.slider("3D spacing (cm)", 300, 500, default_spacing_cm, 10, key="gap_mixed")
                 OFFSET = gap
 
                 draw_iter = mix["placed_all"]
@@ -415,3 +415,4 @@ if "single_type_results" in st.session_state or "mixed" in st.session_state:
                 st.plotly_chart(fig, use_container_width=True)
         else:
             st.info("Enable Mixed ULD mode and click **Simulate**.")
+
