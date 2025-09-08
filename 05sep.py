@@ -14,10 +14,10 @@ ULD_SPECS = {
     "LD7": {"length": 300, "width": 240, "height": 162, "max_weight": 5000},
     "PLA": {"length": 307, "width": 142, "height": 162, "max_weight": 3174},
 }
-VOLUME_UNITS = {"AKE": 4.0, "LD7": 10.0, "PLA": 8.0}  # used as cost proxy in greedy planner
+VOLUME_UNITS = {"AKE": 4.0, "LD7": 10.0, "PLA": 8.0}  # cost proxy
 ULD_ORDER = ["AKE", "LD7", "PLA"]
 
-# Colors: ULD outlines by type; boxes one standard color
+# Colors
 MIXED_COLORS = {"AKE": "#000000", "LD7": "#00aa00", "PLA": "#cc0000"}
 BOX_COLOR = "#1f77b4"
 
@@ -25,11 +25,10 @@ st.set_page_config(layout="wide", initial_sidebar_state="collapsed")
 st.title("Estimation Load Plan")
 
 # ==============================
-# Sidebar (only core settings)
+# Sidebar
 # ==============================
 st.sidebar.header("Settings")
 run_mixed = st.sidebar.checkbox("Enable Mixed ULD mode", value=True)
-# keep within the requested tight range for spacing
 default_spacing_cm = st.sidebar.slider("Default ULD spacing (cm) when visualizing", 200, 500, 250, 10)
 MAX_BOXES_TO_DRAW = st.sidebar.number_input(
     "Max boxes to draw in 3D",
@@ -38,7 +37,7 @@ MAX_BOXES_TO_DRAW = st.sidebar.number_input(
 )
 
 # ==============================
-# Number of cargo types (outside form so it updates immediately)
+# Number of cargo types
 # ==============================
 num_items = st.number_input("Number of cargo types", min_value=1, max_value=20, value=1, key="num_items")
 
@@ -61,7 +60,20 @@ with st.form("cargo_input"):
     submitted = st.form_submit_button("Simulate")
 
 # ==============================
-# Packer (FFD shelf; upright; L/W swap allowed)
+# Helpers
+# ==============================
+def normalize_boxes(boxes):
+    """Force (length >= width) so (120x100) == (100x120)."""
+    out = []
+    for b in boxes:
+        l, w = b["length"], b["width"]
+        if w > l:
+            l, w = w, l
+        out.append({**b, "length": l, "width": w})
+    return out
+
+# ==============================
+# FFD shelf packer (upright; prefers shorter side along ULD length)
 # ==============================
 def pack_boxes_ffd_shelf(boxes, uld_spec):
     L, W, H, WMAX = uld_spec["length"], uld_spec["width"], uld_spec["height"], uld_spec["max_weight"]
@@ -92,7 +104,14 @@ def pack_boxes_ffd_shelf(boxes, uld_spec):
                     if i in placed_indices:
                         continue
 
-                    for bl, bw in ((box["length"], box["width"]), (box["width"], box["length"])):
+                    # Orientation preference: shorter side along length first
+                    l0, w0 = box["length"], box["width"]
+                    if l0 >= w0:
+                        orientations = ((w0, l0), (l0, w0))
+                    else:
+                        orientations = ((l0, w0), (w0, l0))
+
+                    for bl, bw in orientations:
                         if (bl <= L - x and
                             bw <= W - row_y and
                             box["height"] <= H - layer_z and
@@ -114,7 +133,10 @@ def pack_boxes_ffd_shelf(boxes, uld_spec):
                             used_weight += box["weight"]
 
                             placed_in_row = placed_in_layer = placed_any = True
-                            break
+                            break  # break orientations loop
+
+                    if placed_in_row:
+                        continue
 
                 if not placed_in_row:
                     break
@@ -133,7 +155,7 @@ def pack_boxes_ffd_shelf(boxes, uld_spec):
     return packed, uld_count
 
 # ==============================
-# Speed helpers: hashable multiset key + cached packer
+# Speed helpers: multiset key + cached packer
 # ==============================
 def boxes_key_tuple(boxes):
     return tuple(sorted((b["length"], b["width"], b["height"], b["weight"]) for b in boxes))
@@ -145,9 +167,15 @@ def _pack_ffd_cached(uld_name, boxes_key):
     return pack_boxes_ffd_shelf(bxs, spec)
 
 # ==============================
-# Mixed optimizer (fast greedy + caching)
+# Mixed optimizer (single-instance efficiency greedy)
 # ==============================
 def pack_mixed_optimizer_fast(boxes, uld_specs, unit_costs):
+    """
+    Greedy by single-instance efficiency:
+      - For each type, pack remaining boxes; take ONLY the first instance (uld_id==0).
+      - Efficiency = boxes_in_first_instance / unit_cost[type].
+      - Pick the best; remove those boxes (orientation-invariant); repeat.
+    """
     remaining = list(boxes)
     plan_instances = []
     total_units = 0.0
@@ -156,82 +184,71 @@ def pack_mixed_optimizer_fast(boxes, uld_specs, unit_costs):
 
     while remaining:
         key = boxes_key_tuple(remaining)
-        best = None  # (score, name, packed, cnt, spec)
+        best = None  # (eff, boxes0, -unit_cost, name, spec, grp0)
+
         for name, spec in uld_specs.items():
             packed, cnt = _pack_ffd_cached(name, key)
             if not packed or cnt == float("inf"):
                 continue
-            units = cnt * unit_costs[name]
-            score = (len(packed) / units) if units > 0 else 0.0
-            if best is None or score > best[0]:
-                best = (score, name, packed, cnt, spec)
+
+            groups = defaultdict(list)
+            for p in packed:
+                groups[p["uld_id"]].append({**p})
+            if 0 not in groups:
+                continue
+
+            grp0 = groups[0]
+            boxes0 = len(grp0)
+            if boxes0 == 0:
+                continue
+
+            units_for_one = unit_costs[name]
+            eff = boxes0 / units_for_one
+
+            cand = (eff, boxes0, -units_for_one, name, spec, grp0)
+            if best is None or cand > best:
+                best = cand
 
         if best is None:
-            break
+            break  # no progress
 
-        _, name, packed, cnt, spec = best
+        eff, boxes0, neg_units, name, spec, grp0 = best
 
-        groups = defaultdict(list)
-        for p in packed:
-            groups[p["uld_id"]].append({**p})
-        for _, grp in sorted(groups.items()):
-            for g in grp:
-                g["uld_id"] = 0
-            plan_instances.append({"type": name, "spec": spec, "packed": grp})
+        # materialize ONE instance of this type
+        for g in grp0:
+            g["uld_id"] = 0
+        plan_instances.append({"type": name, "spec": spec, "packed": grp0})
+        total_units += unit_costs[name]
 
-        total_units += cnt * unit_costs[name]
-
-        # remove packed by multiset
+        # ----- REMOVE EXACTLY THE grp0 BOXES (orientation-invariant) -----
         taken = defaultdict(int)
-        for p in packed:
-            taken[(p["length"], p["width"], p["height"], p["weight"])] += 1
+        for p in grp0:
+            # <<< FIX: normalize key for removal >>>
+            L = max(p["length"], p["width"])
+            W = min(p["length"], p["width"])
+            taken[(L, W, p["height"], p["weight"])] += 1
+
         new_remaining = []
         for b in remaining:
-            k = (b["length"], b["width"], b["height"], b["weight"])
+            k = (b["length"], b["width"], b["height"], b["weight"])  # already normalized L>=W
             if taken.get(k, 0) > 0:
                 taken[k] -= 1
             else:
                 new_remaining.append(b)
-        if len(new_remaining) == len(remaining):  # safety
+
+        if len(new_remaining) == len(remaining):  # safety: no progress
             break
         remaining = new_remaining
 
+    # Flatten to placed_all with global index for viz
     placed_all = []
     for idx, inst in enumerate(plan_instances):
         for p in inst["packed"]:
-            q = dict(p); q["uld_idx"] = idx
+            q = dict(p)
+            q["uld_idx"] = idx
             placed_all.append(q)
+
     return plan_instances, total_units, placed_all
-
-# ==============================
-# Viz helpers
-# ==============================
-EDGES = [(0,1),(1,2),(2,3),(3,0),
-         (4,5),(5,6),(6,7),(7,4),
-         (0,4),(1,5),(2,6),(3,7)]
-
-def draw_box_wireframe(fig, corners, color, width=2, showlegend=False, name=None):
-    for e in EDGES:
-        fig.add_trace(go.Scatter3d(
-            x=[corners[e[0]][0], corners[e[1]][0]],
-            y=[corners[e[0]][1], corners[e[1]][1]],
-            z=[corners[e[0]][2], corners[e[1]][2]],
-            mode="lines", line=dict(color=color, width=width),
-            showlegend=showlegend, name=name
-        ))
-
-# ==============================
-# NEW: normalize so 120x100x100 == 100x120x100
-# ==============================
-def normalize_boxes(boxes):
-    """Force (length >= width) so base-rotation inputs are equivalent."""
-    out = []
-    for b in boxes:
-        l, w = b["length"], b["width"]
-        if w > l:
-            l, w = w, l
-        out.append({**b, "length": l, "width": w})
-    return out
 
 # ==============================
 # Run simulation
@@ -246,10 +263,8 @@ if submitted:
                 "height": item["height"], "weight": item["weight"]
             })
 
-    # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-    # Normalize so base rotation is order-invariant (ONLY CHANGE)
+    # Normalize so base rotation is order-invariant (L >= W)
     all_boxes = normalize_boxes(all_boxes)
-    # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
     # Early reject: items that can't fit any ULD (saves time)
     def fits_any_uld(b):
@@ -278,7 +293,7 @@ if submitted:
     st.session_state.single_type_results = single_results
     st.session_state.single_counts = single_counts
 
-    # Mixed results (fast)
+    # Mixed results (single-instance efficiency greedy)
     if run_mixed:
         instances, total_units, placed_all = pack_mixed_optimizer_fast(all_boxes, ULD_SPECS, VOLUME_UNITS)
         st.session_state.mixed = {"instances": instances, "total_units": total_units, "placed_all": placed_all} if instances else None
@@ -286,12 +301,28 @@ if submitted:
         st.session_state.mixed = None
 
 # ==============================
-# Display results (with 3D-on-demand buttons)
+# Viz helpers
+# ==============================
+EDGES = [(0,1),(1,2),(2,3),(3,0),
+         (4,5),(5,6),(6,7),(7,4),
+         (0,4),(1,5),(2,6),(3,7)]
+
+def draw_box_wireframe(fig, corners, color, width=2, showlegend=False, name=None):
+    for e in EDGES:
+        fig.add_trace(go.Scatter3d(
+            x=[corners[e[0]][0], corners[e[1]][0]],
+            y=[corners[e[0]][1], corners[e[1]][1]],
+            z=[corners[e[0]][2], corners[e[1]][2]],
+            mode="lines", line=dict(color=color, width=width),
+            showlegend=showlegend, name=name
+        ))
+
+# ==============================
+# Display results (with 3D-on-demand)
 # ==============================
 if "single_type_results" in st.session_state or "mixed" in st.session_state:
     tab_single, tab_mixed = st.tabs(["Single ULD results", "Mixed ULD plan"])
 
-    # Persist button states in session_state
     if "show3d_single" not in st.session_state: st.session_state.show3d_single = False
     if "show3d_mixed"  not in st.session_state: st.session_state.show3d_mixed  = False
 
@@ -302,8 +333,8 @@ if "single_type_results" in st.session_state or "mixed" in st.session_state:
             used_types = [t for t in ULD_ORDER if t in counts]
             df = pd.DataFrame(
                 [
-                    [t for t in used_types],            # Row 1
-                    [counts[t] for t in used_types],    # Row 2
+                    [t for t in used_types],
+                    [counts[t] for t in used_types],
                 ],
                 index=["Type of ULD", "Amount needed"],
                 columns=used_types
@@ -315,7 +346,6 @@ if "single_type_results" in st.session_state or "mixed" in st.session_state:
             chosen_result, cnt, spec = st.session_state.single_type_results[choice]
             st.info(f"{choice}: {cnt} used")
 
-            # Button to show 3D
             if st.button("Show 3D layout (Single ULD)"):
                 st.session_state.show3d_single = True
 
@@ -329,8 +359,7 @@ if "single_type_results" in st.session_state or "mixed" in st.session_state:
                     draw_iter = draw_iter[:MAX_BOXES_TO_DRAW]
 
                 fig = go.Figure()
-
-                # ULD frames
+                # Frames
                 for uld_id in sorted(set(b["uld_id"] for b in draw_iter)):
                     x0 = uld_id * OFFSET
                     x1 = x0 + spec["length"]
@@ -338,7 +367,6 @@ if "single_type_results" in st.session_state or "mixed" in st.session_state:
                     corners = [[x0,0,0],[x1,0,0],[x1,y1,0],[x0,y1,0],
                                [x0,0,z1],[x1,0,z1],[x1,y1,z1],[x0,y1,z1]]
                     draw_box_wireframe(fig, corners, color="#666666", width=3)
-
                 # Boxes
                 for b in draw_iter:
                     x = b["x"] + b["uld_id"] * OFFSET
@@ -349,14 +377,11 @@ if "single_type_results" in st.session_state or "mixed" in st.session_state:
                     draw_box_wireframe(fig, corners, color=BOX_COLOR, width=2)
 
                 fig.update_layout(
-                    scene=dict(
-                        xaxis=dict(title="Length (cm)"),
-                        yaxis=dict(title="Width (cm)"),
-                        zaxis=dict(title="Height (cm)"),
-                        aspectmode="data"
-                    ),
-                    margin=dict(l=0, r=0, b=0, t=30),
-                    height=700
+                    scene=dict(xaxis=dict(title="Length (cm)"),
+                               yaxis=dict(title="Width (cm)"),
+                               zaxis=dict(title="Height (cm)"),
+                               aspectmode="data"),
+                    margin=dict(l=0, r=0, b=0, t=30), height=700
                 )
                 st.plotly_chart(fig, use_container_width=True)
         else:
@@ -382,7 +407,6 @@ if "single_type_results" in st.session_state or "mixed" in st.session_state:
             else:
                 st.info("No ULDs used for the current inputs.")
 
-            # Button to show 3D
             if st.button("Show 3D layout (Mixed ULD plan)"):
                 st.session_state.show3d_mixed = True
 
@@ -396,7 +420,6 @@ if "single_type_results" in st.session_state or "mixed" in st.session_state:
                     draw_iter = draw_iter[:MAX_BOXES_TO_DRAW]
 
                 fig = go.Figure()
-
                 # ULD outlines by type
                 for idx, inst in enumerate(mix["instances"]):
                     spec = inst["spec"]
@@ -407,7 +430,6 @@ if "single_type_results" in st.session_state or "mixed" in st.session_state:
                     corners = [[x0,0,0],[x1,0,0],[x1,y1,0],[x0,y1,0],
                                [x0,0,z1],[x1,0,z1],[x1,y1,z1],[x0,y1,z1]]
                     draw_box_wireframe(fig, corners, color=color, width=4, showlegend=True, name=f"{inst['type']} #{idx}")
-
                 # Boxes
                 for b in draw_iter:
                     if "uld_idx" not in b or b["uld_idx"] < 0 or b["uld_idx"] >= len(mix["instances"]):
@@ -420,14 +442,11 @@ if "single_type_results" in st.session_state or "mixed" in st.session_state:
                     draw_box_wireframe(fig, corners, color=BOX_COLOR, width=2)
 
                 fig.update_layout(
-                    scene=dict(
-                        xaxis=dict(title="Length (cm)"),
-                        yaxis=dict(title="Width (cm)"),
-                        zaxis=dict(title="Height (cm)"),
-                        aspectmode="data"
-                    ),
-                    margin=dict(l=0, r=0, b=0, t=30),
-                    height=700,
+                    scene=dict(xaxis=dict(title="Length (cm)"),
+                               yaxis=dict(title="Width (cm)"),
+                               zaxis=dict(title="Height (cm)"),
+                               aspectmode="data"),
+                    margin=dict(l=0, r=0, b=0, t=30), height=700,
                     legend=dict(itemsizing="constant")
                 )
                 st.plotly_chart(fig, use_container_width=True)
