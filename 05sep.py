@@ -7,35 +7,45 @@ from collections import Counter, defaultdict
 from functools import lru_cache
 
 # ==============================
-# ULD definitions 
+# ULD definitions
 # ==============================
 ULD_SPECS = {
-    "AKE": {"length": 142, "width": 139, "height": 159, "max_weight": 1500},  
-    "LD7": {"length": 300, "width": 240, "height": 162, "max_weight": 5000}, 
-    "PLA": {"length": 307, "width": 142, "height": 162, "max_weight": 3174}, 
+    "AKE": {"length": 142, "width": 139, "height": 159, "max_weight": 1500},
+    "LD7": {"length": 300, "width": 240, "height": 162, "max_weight": 5000},
+    "PLA": {"length": 307, "width": 142, "height": 162, "max_weight": 3174},
 }
-VOLUME_UNITS = {"AKE": 4.0, "LD7": 10.0, "PLA": 8.0}  
-ULD_ORDER = ["AKE", "LD7", "PLA"] 
+VOLUME_UNITS = {"AKE": 4.0, "LD7": 10.0, "PLA": 8.0}  # used as cost proxy in greedy planner
+ULD_ORDER = ["AKE", "LD7", "PLA"]
 
-# Colors: ULD outlines by type; boxes one standard color everywhere
-MIXED_COLORS = {"AKE": "#000000", "LD7": "#00aa00", "PLA": "#cc0000"}  
-BOX_COLOR = "#1f77b4"  # standardized box color
+# Colors: ULD outlines by type; boxes one standard color
+MIXED_COLORS = {"AKE": "#000000", "LD7": "#00aa00", "PLA": "#cc0000"}
+BOX_COLOR = "#1f77b4"
 
 st.set_page_config(layout="wide", initial_sidebar_state="collapsed")
 st.title("Estimation Load Plan")
 
 # ==============================
-# Sidebar
+# Sidebar (only core settings)
 # ==============================
 st.sidebar.header("Settings")
 run_mixed = st.sidebar.checkbox("Enable Mixed ULD mode", value=True)
-gap_mixed_default = st.sidebar.slider("Mixed mode spacing (cm)", 300, 500, 250, 10)
+# keep within the requested tight range for spacing
+default_spacing_cm = st.sidebar.slider("Default ULD spacing (cm) when visualizing", 200, 300, 250, 10)
+MAX_BOXES_TO_DRAW = st.sidebar.number_input(
+    "Max boxes to draw in 3D",
+    min_value=50, max_value=5000, value=400, step=50,
+    help="Limit 3D drawing for performance."
+)
+
+# ==============================
+# Number of cargo types (outside form so it updates immediately)
+# ==============================
+num_items = st.number_input("Number of cargo types", min_value=1, max_value=20, value=1, key="num_items")
 
 # ==============================
 # Input form
 # ==============================
 with st.form("cargo_input"):
-    num_items = st.number_input("Number of cargo types", min_value=1, max_value=20, value=1)
     cargo_data = []
     for i in range(num_items):
         st.markdown(f"**Cargo {i+1}**")
@@ -51,7 +61,7 @@ with st.form("cargo_input"):
     submitted = st.form_submit_button("Simulate")
 
 # ==============================
-# FFD Shelf Packer (upright only, L/W rotation allowed)
+# Packer (FFD shelf; upright; L/W swap allowed)
 # ==============================
 def pack_boxes_ffd_shelf(boxes, uld_spec):
     L, W, H, WMAX = uld_spec["length"], uld_spec["width"], uld_spec["height"], uld_spec["max_weight"]
@@ -123,70 +133,81 @@ def pack_boxes_ffd_shelf(boxes, uld_spec):
     return packed, uld_count
 
 # ==============================
-# Mixed-Type Optimizer (recursive search)
+# Speed helpers: hashable multiset key + cached packer
 # ==============================
-def pack_mixed_optimizer(boxes, uld_specs, unit_costs):
-    def pack_into_type(bxs, type_name):
-        spec = uld_specs[type_name]
-        packed, cnt = pack_boxes_ffd_shelf(copy.deepcopy(bxs), spec)
-        if not packed or cnt == float("inf"):
-            return None, float("inf")
+def boxes_key_tuple(boxes):
+    return tuple(sorted((b["length"], b["width"], b["height"], b["weight"]) for b in boxes))
+
+@lru_cache(maxsize=4096)
+def _pack_ffd_cached(uld_name, boxes_key):
+    spec = ULD_SPECS[uld_name]
+    bxs = [{"length": l, "width": w, "height": h, "weight": wt} for (l, w, h, wt) in boxes_key]
+    return pack_boxes_ffd_shelf(bxs, spec)
+
+# ==============================
+# Mixed optimizer (fast greedy + caching)
+# ==============================
+def pack_mixed_optimizer_fast(boxes, uld_specs, unit_costs):
+    remaining = list(boxes)
+    plan_instances = []
+    total_units = 0.0
+    if not remaining:
+        return [], 0.0, []
+
+    while remaining:
+        key = boxes_key_tuple(remaining)
+        best = None  # (score, name, packed, cnt, spec)
+        for name, spec in uld_specs.items():
+            packed, cnt = _pack_ffd_cached(name, key)
+            if not packed or cnt == float("inf"):
+                continue
+            units = cnt * unit_costs[name]
+            score = (len(packed) / units) if units > 0 else 0.0
+            if best is None or score > best[0]:
+                best = (score, name, packed, cnt, spec)
+
+        if best is None:
+            break
+
+        _, name, packed, cnt, spec = best
+
         groups = defaultdict(list)
         for p in packed:
             groups[p["uld_id"]].append({**p})
-        instances = []
         for _, grp in sorted(groups.items()):
             for g in grp:
                 g["uld_id"] = 0
-            instances.append({"type": type_name, "spec": spec, "packed": grp})
-        units = cnt * unit_costs[type_name]
-        return instances, units
+            plan_instances.append({"type": name, "spec": spec, "packed": grp})
 
-    def key_fn(bxs):
-        return json.dumps(sorted(bxs, key=lambda x: (x["length"], x["width"], x["height"], x["weight"])))
+        total_units += cnt * unit_costs[name]
 
-    @lru_cache(maxsize=None)
-    def search(bxs_json):
-        bxs = json.loads(bxs_json)
-        if not bxs:
-            return [], 0.0
-
-        best_plan, best_units = None, float("inf")
-
-        for name in uld_specs.keys():
-            insts, units = pack_into_type(bxs, name)
-            if insts is not None and units < best_units:
-                best_plan, best_units = insts, units
-
-        n = len(bxs)
-        if n > 1:
-            for i in range(1, n):
-                left, right = bxs[:i], bxs[i:]
-                lp, lu = search(key_fn(left))
-                rp, ru = search(key_fn(right))
-                if lp is not None and rp is not None:
-                    total = lu + ru
-                    if total < best_units:
-                        best_plan, best_units = lp + rp, total
-
-        return best_plan, best_units
-
-    plan, total_units = search(key_fn(boxes))
-    if plan is None:
-        return None, float("inf"), None
+        # remove packed by multiset
+        taken = defaultdict(int)
+        for p in packed:
+            taken[(p["length"], p["width"], p["height"], p["weight"])] += 1
+        new_remaining = []
+        for b in remaining:
+            k = (b["length"], b["width"], b["height"], b["weight"])
+            if taken.get(k, 0) > 0:
+                taken[k] -= 1
+            else:
+                new_remaining.append(b)
+        if len(new_remaining) == len(remaining):  # safety
+            break
+        remaining = new_remaining
 
     placed_all = []
-    for idx, inst in enumerate(plan):
+    for idx, inst in enumerate(plan_instances):
         for p in inst["packed"]:
-            q = dict(p)
-            q["uld_idx"] = idx
+            q = dict(p); q["uld_idx"] = idx
             placed_all.append(q)
-    return plan, total_units, placed_all
+    return plan_instances, total_units, placed_all
 
 # ==============================
 # Run simulation
 # ==============================
 if submitted:
+    # expand all boxes
     all_boxes = []
     for item in cargo_data:
         for _ in range(item["quantity"]):
@@ -195,29 +216,42 @@ if submitted:
                 "height": item["height"], "weight": item["weight"]
             })
 
-    # Single-ULD results (counts per type)
+    # Early reject: items that can't fit any ULD (saves time)
+    def fits_any_uld(b):
+        for s in ULD_SPECS.values():
+            if b["height"] <= s["height"] and b["weight"] <= s["max_weight"]:
+                if ((b["length"] <= s["length"] and b["width"] <= s["width"]) or
+                    (b["width"] <= s["length"] and b["length"] <= s["width"])):
+                    return True
+        return False
+
+    filtered = [b for b in all_boxes if fits_any_uld(b)]
+    dropped = len(all_boxes) - len(filtered)
+    all_boxes = filtered
+    if dropped:
+        st.warning(f"{dropped} item(s) cannot fit in any ULD and were excluded.")
+
+    # Single-ULD results (cached)
     single_results = {}
-    single_counts = {}  # name -> count
+    single_counts = {}
+    key_all = boxes_key_tuple(all_boxes)
     for name, spec in ULD_SPECS.items():
-        packed, cnt = pack_boxes_ffd_shelf(copy.deepcopy(all_boxes), spec)
+        packed, cnt = _pack_ffd_cached(name, key_all)
         if packed:
             single_results[name] = (packed, cnt, spec)
             single_counts[name] = cnt
     st.session_state.single_type_results = single_results
     st.session_state.single_counts = single_counts
 
-    # Mixed results
+    # Mixed results (fast)
     if run_mixed:
-        instances, total_units, placed_all = pack_mixed_optimizer(all_boxes, ULD_SPECS, VOLUME_UNITS)
-        if instances:
-            st.session_state.mixed = {"instances": instances, "total_units": total_units, "placed_all": placed_all}
-        else:
-            st.session_state.mixed = None
+        instances, total_units, placed_all = pack_mixed_optimizer_fast(all_boxes, ULD_SPECS, VOLUME_UNITS)
+        st.session_state.mixed = {"instances": instances, "total_units": total_units, "placed_all": placed_all} if instances else None
     else:
         st.session_state.mixed = None
 
 # ==============================
-# Visualization helpers
+# Viz helpers
 # ==============================
 EDGES = [(0,1),(1,2),(2,3),(3,0),
          (4,5),(5,6),(6,7),(7,4),
@@ -234,68 +268,79 @@ def draw_box_wireframe(fig, corners, color, width=2, showlegend=False, name=None
         ))
 
 # ==============================
-# Show results
+# Display results (with 3D-on-demand buttons)
 # ==============================
 if "single_type_results" in st.session_state or "mixed" in st.session_state:
     tab_single, tab_mixed = st.tabs(["Single ULD results", "Mixed ULD plan"])
 
-    # --- Single ULD tab---
+    # Persist button states in session_state
+    if "show3d_single" not in st.session_state: st.session_state.show3d_single = False
+    if "show3d_mixed"  not in st.session_state: st.session_state.show3d_mixed  = False
+
+    # --- Single ULD tab ---
     with tab_single:
         counts = st.session_state.get("single_counts", {})
         if counts:
-            # Build 2-row table: Type of ULD (row 1), Amount needed (row 2)
             used_types = [t for t in ULD_ORDER if t in counts]
-            data = [
-                [t for t in used_types],            # Row 1
-                [counts[t] for t in used_types],    # Row 2
-            ]
             df = pd.DataFrame(
-                data,
+                [
+                    [t for t in used_types],            # Row 1
+                    [counts[t] for t in used_types],    # Row 2
+                ],
                 index=["Type of ULD", "Amount needed"],
                 columns=used_types
-            )
+            ).astype(str)
             st.subheader("Single-ULD results (FFD)")
             st.table(df)
 
-            # Visualize a selected single-ULD packing
-            choice = st.selectbox("Select ULD to visualize", used_types)
+            choice = st.selectbox("Select ULD to visualize (3D available on demand)", used_types)
             chosen_result, cnt, spec = st.session_state.single_type_results[choice]
             st.info(f"{choice}: {cnt} used")
 
-            gap = st.slider("ULD spacing (cm)", 300, 800, 350, 10, key="gap_single")
-            OFFSET = gap
+            # Button to show 3D
+            if st.button("Show 3D layout (Single ULD)"):
+                st.session_state.show3d_single = True
 
-            fig = go.Figure()
+            if st.session_state.show3d_single:
+                gap = st.slider("3D spacing (cm)", 200, 300, default_spacing_cm, 10, key="gap_single")
+                OFFSET = gap
 
-            # ULD frames
-            for uld_id in sorted(set(b["uld_id"] for b in chosen_result)):
-                x0 = uld_id * OFFSET
-                x1 = x0 + spec["length"]
-                y1, z1 = spec["width"], spec["height"]
-                corners = [[x0,0,0],[x1,0,0],[x1,y1,0],[x0,y1,0],
-                           [x0,0,z1],[x1,0,z1],[x1,y1,z1],[x0,y1,z1]]
-                draw_box_wireframe(fig, corners, color="#666666", width=3)
+                draw_iter = chosen_result
+                if len(draw_iter) > MAX_BOXES_TO_DRAW:
+                    st.caption(f"Showing first {MAX_BOXES_TO_DRAW}/{len(draw_iter)} boxes for performance.")
+                    draw_iter = draw_iter[:MAX_BOXES_TO_DRAW]
 
-            # Boxes (standard color)
-            for b in chosen_result:
-                x = b["x"] + b["uld_id"] * OFFSET
-                y, z = b["y"], b["z"]
-                l, w, h = b["length"], b["width"], b["height"]
-                corners = [[x,y,z],[x+l,y,z],[x+l,y+w,z],[x,y+w,z],
-                           [x,y,z+h],[x+l,y,z+h],[x+l,y+w,z+h],[x,y+w,z+h]]
-                draw_box_wireframe(fig, corners, color=BOX_COLOR, width=2)
+                fig = go.Figure()
 
-            fig.update_layout(
-                scene=dict(
-                    xaxis=dict(title="Length (cm)"),
-                    yaxis=dict(title="Width (cm)"),
-                    zaxis=dict(title="Height (cm)"),
-                    aspectmode="data"
-                ),
-                margin=dict(l=0, r=0, b=0, t=30),
-                height=700
-            )
-            st.plotly_chart(fig, use_container_width=True)
+                # ULD frames
+                for uld_id in sorted(set(b["uld_id"] for b in draw_iter)):
+                    x0 = uld_id * OFFSET
+                    x1 = x0 + spec["length"]
+                    y1, z1 = spec["width"], spec["height"]
+                    corners = [[x0,0,0],[x1,0,0],[x1,y1,0],[x0,y1,0],
+                               [x0,0,z1],[x1,0,z1],[x1,y1,z1],[x0,y1,z1]]
+                    draw_box_wireframe(fig, corners, color="#666666", width=3)
+
+                # Boxes
+                for b in draw_iter:
+                    x = b["x"] + b["uld_id"] * OFFSET
+                    y, z = b["y"], b["z"]
+                    l, w, h = b["length"], b["width"], b["height"]
+                    corners = [[x,y,z],[x+l,y,z],[x+l,y+w,z],[x,y+w,z],
+                               [x,y,z+h],[x+l,y,z+h],[x+l,y+w,z+h],[x,y+w,z+h]]
+                    draw_box_wireframe(fig, corners, color=BOX_COLOR, width=2)
+
+                fig.update_layout(
+                    scene=dict(
+                        xaxis=dict(title="Length (cm)"),
+                        yaxis=dict(title="Width (cm)"),
+                        zaxis=dict(title="Height (cm)"),
+                        aspectmode="data"
+                    ),
+                    margin=dict(l=0, r=0, b=0, t=30),
+                    height=700
+                )
+                st.plotly_chart(fig, use_container_width=True)
         else:
             st.info("No single-type packing feasible with current inputs.")
 
@@ -303,82 +348,70 @@ if "single_type_results" in st.session_state or "mixed" in st.session_state:
     with tab_mixed:
         mix = st.session_state.get("mixed")
         if mix:
-            # Defensive rebuild of placed_all
-            placed_all = mix.get("placed_all") or []
-            if any("uld_idx" not in b for b in placed_all):
-                rebuilt = []
-                for idx, inst in enumerate(mix["instances"]):
-                    for p in inst["packed"]:
-                        q = dict(p)
-                        q["uld_idx"] = idx
-                        rebuilt.append(q)
-                mix["placed_all"] = rebuilt
-                st.session_state.mixed = mix
-
-           
             type_counts = Counter(inst["type"] for inst in mix["instances"])
             used_types = [t for t in ULD_ORDER if type_counts[t] > 0]
-            if not used_types:
-                st.info("No ULDs used for the current inputs.")
-            else:
-                data = [
-                    [t for t in used_types],
-                    [type_counts[t] for t in used_types],
-                ]
+            if used_types:
                 df = pd.DataFrame(
-                    data,
+                    [
+                        [t for t in used_types],
+                        [type_counts[t] for t in used_types],
+                    ],
                     index=["Type of ULD", "Amount needed"],
                     columns=used_types
-                )
+                ).astype(str)
                 st.subheader("Mixed ULD plan")
                 st.table(df)
+            else:
+                st.info("No ULDs used for the current inputs.")
 
-            # Visualization
-            gap = st.slider("ULD spacing (cm)", 400, 800, 400, 10, key="gap_mixed")
-            OFFSET = gap
+            # Button to show 3D
+            if st.button("Show 3D layout (Mixed ULD plan)"):
+                st.session_state.show3d_mixed = True
 
-            fig = go.Figure()
+            if st.session_state.show3d_mixed and mix.get("instances"):
+                gap = st.slider("3D spacing (cm)", 200, 300, default_spacing_cm, 10, key="gap_mixed")
+                OFFSET = gap
 
-            # ULD outlines by type
-            for idx, inst in enumerate(mix["instances"]):
-                spec = inst["spec"]
-                color = MIXED_COLORS.get(inst["type"], "#666666")
-                x0 = idx * OFFSET
-                x1 = x0 + spec["length"]
-                y1, z1 = spec["width"], spec["height"]
-                corners = [[x0,0,0],[x1,0,0],[x1,y1,0],[x0,y1,0],
-                           [x0,0,z1],[x1,0,z1],[x1,y1,z1],[x0,y1,z1]]
-                draw_box_wireframe(fig, corners, color=color, width=4, showlegend=True, name=f"{inst['type']} #{idx}")
+                draw_iter = mix["placed_all"]
+                if len(draw_iter) > MAX_BOXES_TO_DRAW:
+                    st.caption(f"Showing first {MAX_BOXES_TO_DRAW}/{len(draw_iter)} boxes for performance.")
+                    draw_iter = draw_iter[:MAX_BOXES_TO_DRAW]
 
-            # Boxes (standard color)
-            for b in mix["placed_all"]:
-                if "uld_idx" not in b or b["uld_idx"] < 0 or b["uld_idx"] >= len(mix["instances"]):
-                    continue
-                x = b["x"] + b["uld_idx"] * OFFSET
-                y, z = b["y"], b["z"]
-                l, w, h = b["length"], b["width"], b["height"]
-                corners = [[x,y,z],[x+l,y,z],[x+l,y+w,z],[x,y+w,z],
-                           [x,y,z+h],[x+l,y,z+h],[x+l,y+w,z+h],[x,y+w,z+h]]
-                draw_box_wireframe(fig, corners, color=BOX_COLOR, width=2)
+                fig = go.Figure()
 
-            fig.update_layout(
-                scene=dict(
-                    xaxis=dict(title="Length (cm)"),
-                    yaxis=dict(title="Width (cm)"),
-                    zaxis=dict(title="Height (cm)"),
-                    aspectmode="data"
-                ),
-                margin=dict(l=0, r=0, b=0, t=30),
-                height=700,
-                legend=dict(itemsizing="constant")
-            )
-            st.plotly_chart(fig, use_container_width=True)
+                # ULD outlines by type
+                for idx, inst in enumerate(mix["instances"]):
+                    spec = inst["spec"]
+                    color = MIXED_COLORS.get(inst["type"], "#666666")
+                    x0 = idx * OFFSET
+                    x1 = x0 + spec["length"]
+                    y1, z1 = spec["width"], spec["height"]
+                    corners = [[x0,0,0],[x1,0,0],[x1,y1,0],[x0,y1,0],
+                               [x0,0,z1],[x1,0,z1],[x1,y1,z1],[x0,y1,z1]]
+                    draw_box_wireframe(fig, corners, color=color, width=4, showlegend=True, name=f"{inst['type']} #{idx}")
+
+                # Boxes
+                for b in draw_iter:
+                    if "uld_idx" not in b or b["uld_idx"] < 0 or b["uld_idx"] >= len(mix["instances"]):
+                        continue
+                    x = b["x"] + b["uld_idx"] * OFFSET
+                    y, z = b["y"], b["z"]
+                    l, w, h = b["length"], b["width"], b["height"]
+                    corners = [[x,y,z],[x+l,y,z],[x+l,y+w,z],[x,y+w,z],
+                               [x,y,z+h],[x+l,y,z+h],[x+l,y+w,z+h],[x,y+w,z+h]]
+                    draw_box_wireframe(fig, corners, color=BOX_COLOR, width=2)
+
+                fig.update_layout(
+                    scene=dict(
+                        xaxis=dict(title="Length (cm)"),
+                        yaxis=dict(title="Width (cm)"),
+                        zaxis=dict(title="Height (cm)"),
+                        aspectmode="data"
+                    ),
+                    margin=dict(l=0, r=0, b=0, t=30),
+                    height=700,
+                    legend=dict(itemsizing="constant")
+                )
+                st.plotly_chart(fig, use_container_width=True)
         else:
             st.info("Enable Mixed ULD mode and click **Simulate**.")
-
-
-
-
-
-
-
