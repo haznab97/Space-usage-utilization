@@ -204,6 +204,36 @@ def pack_mixed_optimizer_fast(boxes, uld_specs, unit_costs):
     return plan_instances, total_units, placed_all
 
 # ==============================
+# Viz helpers
+# ==============================
+EDGES = [(0,1),(1,2),(2,3),(3,0),
+         (4,5),(5,6),(6,7),(7,4),
+         (0,4),(1,5),(2,6),(3,7)]
+
+def draw_box_wireframe(fig, corners, color, width=2, showlegend=False, name=None):
+    for e in EDGES:
+        fig.add_trace(go.Scatter3d(
+            x=[corners[e[0]][0], corners[e[1]][0]],
+            y=[corners[e[0]][1], corners[e[1]][1]],
+            z=[corners[e[0]][2], corners[e[1]][2]],
+            mode="lines", line=dict(color=color, width=width),
+            showlegend=showlegend, name=name
+        ))
+
+# ==============================
+# NEW: normalize so 120x100x100 == 100x120x100
+# ==============================
+def normalize_boxes(boxes):
+    """Force (length >= width) so base-rotation inputs are equivalent."""
+    out = []
+    for b in boxes:
+        l, w = b["length"], b["width"]
+        if w > l:
+            l, w = w, l
+        out.append({**b, "length": l, "width": w})
+    return out
+
+# ==============================
 # Run simulation
 # ==============================
 if submitted:
@@ -215,6 +245,11 @@ if submitted:
                 "length": item["length"], "width": item["width"],
                 "height": item["height"], "weight": item["weight"]
             })
+
+    # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+    # Normalize so base rotation is order-invariant (ONLY CHANGE)
+    all_boxes = normalize_boxes(all_boxes)
+    # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
     # Early reject: items that can't fit any ULD (saves time)
     def fits_any_uld(b):
@@ -249,23 +284,6 @@ if submitted:
         st.session_state.mixed = {"instances": instances, "total_units": total_units, "placed_all": placed_all} if instances else None
     else:
         st.session_state.mixed = None
-
-# ==============================
-# Viz helpers
-# ==============================
-EDGES = [(0,1),(1,2),(2,3),(3,0),
-         (4,5),(5,6),(6,7),(7,4),
-         (0,4),(1,5),(2,6),(3,7)]
-
-def draw_box_wireframe(fig, corners, color, width=2, showlegend=False, name=None):
-    for e in EDGES:
-        fig.add_trace(go.Scatter3d(
-            x=[corners[e[0]][0], corners[e[1]][0]],
-            y=[corners[e[0]][1], corners[e[1]][1]],
-            z=[corners[e[0]][2], corners[e[1]][2]],
-            mode="lines", line=dict(color=color, width=width),
-            showlegend=showlegend, name=name
-        ))
 
 # ==============================
 # Display results (with 3D-on-demand buttons)
@@ -415,4 +433,3 @@ if "single_type_results" in st.session_state or "mixed" in st.session_state:
                 st.plotly_chart(fig, use_container_width=True)
         else:
             st.info("Enable Mixed ULD mode and click **Simulate**.")
-
