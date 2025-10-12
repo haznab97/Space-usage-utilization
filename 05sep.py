@@ -10,8 +10,8 @@ from functools import lru_cache
 # ULD definitions
 # ==============================
 ULD_SPECS = {
-    "AKE": {"length": 142, "width": 139, "height": 159, "max_weight": 1500},
-    "LD7": {"length": 300, "width": 240, "height": 162, "max_weight": 5000},
+    "AKE": {"length": 142, "width": 139, "height": 160, "max_weight": 1587},
+    "LD7": {"length": 310, "width": 243, "height": 162, "max_weight": 5035},
     "PLA": {"length": 307, "width": 142, "height": 162, "max_weight": 3174},
 }
 VOLUME_UNITS = {"AKE": 4.0, "LD7": 10.0, "PLA": 8.0}  # cost proxy
@@ -452,3 +452,4 @@ if "single_type_results" in st.session_state or "mixed" in st.session_state:
                 st.plotly_chart(fig, use_container_width=True)
         else:
             st.info("Enable Mixed ULD mode and click **Simulate**.")
+
