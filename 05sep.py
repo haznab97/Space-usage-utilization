@@ -171,14 +171,15 @@ def _pack_ffd_cached(uld_name, boxes_key):
 # ==============================
 def pack_mixed_optimizer_fast(boxes, uld_specs, unit_costs):
     """
-    Mixed ULD optimizer with a guard:
-      - Build candidates for each ULD on the SAME remaining set (cached FFD).
-      - Evaluate:
-          * 'finish now' candidates: any type that can pack ALL in ONE instance.
-          * 'first+second' candidates: take first instance of each type, then best second on leftover.
-      - If EXACTLY ONE 'finish now' candidate exists, compare its units vs. the best alternative.
-        Choose the lower total units. (Preserves 2×AKE < 1×LD7, avoids PLA+AKE when 1×LD7 is cheaper.)
-      - Materialize ONLY the chosen FIRST instance each loop (remove boxes orientation-invariant).
+    Mixed ULD optimizer with guard:
+      - Build per-type candidates on the SAME remaining set (cached FFD).
+      - Compare:
+          * single-ULD finish options (any type that can pack ALL in ONE instance)
+          * first+best-second options (two-step look-ahead)
+      - If a single-ULD finish exists and its units are <= the best two-step total,
+        choose the single-ULD finish (prevents PLA+AKE when LD7 is cheaper).
+      - Otherwise, materialize ONLY the chosen FIRST instance, then loop.
+      - Orientation-invariant removal so no boxes get lost.
     """
     from collections import defaultdict
 
@@ -191,7 +192,7 @@ def pack_mixed_optimizer_fast(boxes, uld_specs, unit_costs):
     while remaining:
         key = boxes_key_tuple(remaining)
 
-        # Build per-type candidates on the SAME remaining set
+        # Per-type candidates
         candidates = []
         for name, spec in uld_specs.items():
             packed, cnt = _pack_ffd_cached(name, key)
@@ -204,39 +205,41 @@ def pack_mixed_optimizer_fast(boxes, uld_specs, unit_costs):
                 "name": name,
                 "spec": spec,
                 "packed": packed,
-                "groups": groups,              # local uld_id -> list of placements
-                "cnt": cnt,                    # instances if ONLY this type used
-                "units_one": unit_costs[name], # cost for one instance of this type
+                "groups": groups,                 # local uld_id -> list of placements
+                "cnt": cnt,                       # instances if ONLY this type used
+                "units_one": unit_costs[name],    # cost for one instance
                 "packed_n": len(packed),
             })
 
         if not candidates:
-            break  # no progress possible
+            break  # no progress
 
-        # Build plan options to compare by total units
+        # Collect plan options
         plan_options = []  # (total_units_est, -boxes_first, -boxes_second, first_cand, second_opt_or_None, grp0)
 
-        # "Finish now" candidates: type can pack ALL remaining in ONE instance
-        full_single = [c for c in candidates if c["cnt"] == 1 and c["packed_n"] == len(remaining)]
-        for c in full_single:
-            grp0 = c["groups"].get(0, [])
-            if grp0:
-                plan_options.append((c["units_one"], -len(grp0), 0, c, None, grp0))
+        # (A) Single-ULD "finish now" options (cover ALL in ONE instance)
+        full_single = []
+        for c in candidates:
+            if c["cnt"] == 1 and c["packed_n"] == len(remaining):
+                grp0 = c["groups"].get(0, [])
+                if grp0:
+                    full_single.append((c["units_one"], c, grp0))
+                    plan_options.append((c["units_one"], -len(grp0), 0, c, None, grp0))
 
-        # Two-step look-ahead: first + best second
+        # (B) Two-step look-ahead: first + best second
         for first in candidates:
             grp0 = first["groups"].get(0, [])
             if not grp0:
                 continue
 
-            # Remove grp0 from remaining -> R1
+            # remove grp0 -> R1
             taken = defaultdict(int)
             for p in grp0:
                 L = max(p["length"], p["width"]); W = min(p["length"], p["width"])
                 taken[(L, W, p["height"], p["weight"])] += 1
             R1 = []
             for b in remaining:
-                k = (b["length"], b["width"], b["height"], b["weight"])  # normalized upstream
+                k = (b["length"], b["width"], b["height"], b["weight"])
                 if taken.get(k, 0) > 0:
                     taken[k] -= 1
                 else:
@@ -245,7 +248,6 @@ def pack_mixed_optimizer_fast(boxes, uld_specs, unit_costs):
             units_first = first["units_one"]; boxes_first = len(grp0)
 
             if not R1:
-                # One instance of 'first' completes everything
                 plan_options.append((units_first, -boxes_first, 0, first, None, grp0))
             else:
                 key_R1 = boxes_key_tuple(tuple(R1))
@@ -261,9 +263,9 @@ def pack_mixed_optimizer_fast(boxes, uld_specs, unit_costs):
                     if not grp0_2:
                         continue
                     cand2 = (
-                        units_first + unit_costs[name2],     # total units estimate
-                        -boxes_first,                         # tie-break: more in first
-                        -len(grp0_2),                         # tie-break: then more in second
+                        units_first + unit_costs[name2],    # total units estimate
+                        -boxes_first,                        # prefer more in first
+                        -len(grp0_2),                        # then more in second
                         first,
                         {"name": name2, "spec": spec2, "grp0": grp0_2},
                         grp0
@@ -276,29 +278,23 @@ def pack_mixed_optimizer_fast(boxes, uld_specs, unit_costs):
         if not plan_options:
             break
 
-        # Choose best option by total units
+        # Choose currently-best plan by total units
         best_plan = min(plan_options)
         total_est, neg_b1, neg_b2, first, second_choice, grp0 = best_plan
 
-        # ---- Guardrail you requested ----
-        # If EXACTLY ONE 'finish now' type exists AND it is different from our chosen 'first',
-        # compare totals: if finishing-now units are lower than our chosen plan's estimate,
-        # override and pick that single-ULD finish instead.
-        if len(full_single) == 1:
-            only = full_single[0]
-            single_units = only["units_one"]
-            # If the chosen plan is not already finishing now cheaper:
-            if single_units < total_est:
-                # Override: materialize the single-ULD finish (groups[0])
-                grp_finish = only["groups"].get(0, [])
-                for g in grp_finish:
+        # ----- Guard: if a single-ULD finish exists, prefer it when it's <= best two-step total -----
+        if full_single:
+            best_single_units, best_single_c, best_single_grp0 = min(full_single, key=lambda t: t[0])
+            if best_single_units <= total_est:
+                # Materialize the single-ULD finish
+                for g in best_single_grp0:
                     g["uld_id"] = 0
-                plan_instances.append({"type": only["name"], "spec": only["spec"], "packed": grp_finish})
-                total_units += single_units
+                plan_instances.append({"type": best_single_c["name"], "spec": best_single_c["spec"], "packed": best_single_grp0})
+                total_units += best_single_units
 
-                # remove all (orientation-invariant)
+                # remove (orientation-invariant)
                 taken = defaultdict(int)
-                for p in grp_finish:
+                for p in best_single_grp0:
                     L = max(p["length"], p["width"]); W = min(p["length"], p["width"])
                     taken[(L, W, p["height"], p["weight"])] += 1
                 new_remaining = []
@@ -317,7 +313,7 @@ def pack_mixed_optimizer_fast(boxes, uld_specs, unit_costs):
         plan_instances.append({"type": first["name"], "spec": first["spec"], "packed": grp0})
         total_units += first["units_one"]
 
-        # Remove grp0 (orientation-invariant)
+        # remove grp0 (orientation-invariant)
         taken = defaultdict(int)
         for p in grp0:
             L = max(p["length"], p["width"]); W = min(p["length"], p["width"])
@@ -330,16 +326,15 @@ def pack_mixed_optimizer_fast(boxes, uld_specs, unit_costs):
                 taken[k] -= 1
             else:
                 new_remaining.append(b)
-        if len(new_remaining) == len(remaining):  # safety: no progress
-            break
+        if len(new_remaining) == len(remaining):
+            break  # safety
         remaining = new_remaining
 
-    # Flatten to placed_all for visualization
+    # Flatten for viz
     placed_all = []
     for idx, inst in enumerate(plan_instances):
         for p in inst["packed"]:
-            q = dict(p)
-            q["uld_idx"] = idx
+            q = dict(p); q["uld_idx"] = idx
             placed_all.append(q)
 
     return plan_instances, total_units, placed_all
@@ -547,5 +542,6 @@ if "single_type_results" in st.session_state or "mixed" in st.session_state:
                 st.plotly_chart(fig, use_container_width=True)
         else:
             st.info("Enable Mixed ULD mode and click **Simulate**.")
+
 
 
