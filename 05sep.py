@@ -5,9 +5,7 @@ import json
 import pandas as pd
 from collections import Counter, defaultdict
 from functools import lru_cache
-# add somewhere temporary and click it once
-if st.sidebar.button("Clear pack cache"):
-    _pack_ffd_cached.cache_clear()
+
 # ==============================
 # ULD definitions
 # ==============================
@@ -546,6 +544,9 @@ if "single_type_results" in st.session_state or "mixed" in st.session_state:
             st.info("Enable Mixed ULD mode and click **Simulate**.")
 
 
+# add somewhere temporary and click it once
+if st.sidebar.button("Clear pack cache"):
+    _pack_ffd_cached.cache_clear()
 
 
 
