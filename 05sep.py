@@ -545,3 +545,4 @@ if "single_type_results" in st.session_state or "mixed" in st.session_state:
 
 
 
+
