@@ -39,7 +39,7 @@ MAX_BOXES_TO_DRAW = st.sidebar.number_input(
 # ==============================
 # Number of cargo types
 # ==============================
-num_items = st.number_input("Number of cargo types", min_value=1, max_value=20, value=1, key="num_items")
+num_items = st.number_input("Number of dims types", min_value=1, max_value=20, value=1, key="num_items")
 
 # ==============================
 # Input form
@@ -47,7 +47,7 @@ num_items = st.number_input("Number of cargo types", min_value=1, max_value=20, 
 with st.form("cargo_input"):
     cargo_data = []
     for i in range(num_items):
-        st.markdown(f"**Cargo {i+1}**")
+        st.markdown(f"**Dimension {i+1}**")
         length = st.number_input(f"Length (cm) [{i+1}]", min_value=1, value=100, key=f"l_{i}")
         width  = st.number_input(f"Width (cm)  [{i+1}]", min_value=1, value=100, key=f"w_{i}")
         height = st.number_input(f"Height (cm) [{i+1}]", min_value=1, value=100, key=f"h_{i}")
@@ -452,3 +452,4 @@ if "single_type_results" in st.session_state or "mixed" in st.session_state:
                 st.plotly_chart(fig, use_container_width=True)
         else:
             st.info("Enable Mixed ULD mode and click **Simulate**.")
+
